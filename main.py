@@ -1,93 +1,65 @@
-import os
 import time
+import pytz
 import logging
 from datetime import datetime
+from signals import analyze_market_and_generate_signal
+from utils import send_telegram_message, fetch_news_rating
 
-import requests
-import numpy as np
-import pytz
+# CONFIG
+TZ = pytz.timezone("Europe/London")
+LOOP_SECONDS = 60
+PAIR = "XAUUSD"
+TELEGRAM_CHAT_ID = "1302419329"
 
-
-# -----------------------------
-# Logging setup
-# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("lumi")
+def is_m5_close(now):
+    return now.minute % 5 == 0 and now.second < 3
 
-
-# -----------------------------
-# Config
-# -----------------------------
-
-# You can override these via Render environment variables if you want
-TIMEZONE_NAME = os.getenv("LUMI_TZ", "Europe/London")
-LOOP_SECONDS = int(os.getenv("LUMI_LOOP_SECONDS", "60"))  # heartbeat interval in seconds
-
-
-def get_now_local():
-    """Return timezone-aware datetime in configured timezone."""
-    try:
-        tz = pytz.timezone(TIMEZONE_NAME)
-    except Exception:
-        tz = pytz.timezone("Europe/London")
-    return datetime.now(tz)
-
-
-# -----------------------------
-# Core Lumi logic (placeholder)
-# -----------------------------
-
-def run_lumi_cycle():
-    """
-    One unit of Lumi's work.
-
-    This is where you will eventually:
-      - fetch data from APIs (requests)
-      - process arrays, signals, stats (numpy)
-      - send messages/alerts (e.g. Telegram, Discord, etc.)
-
-    Right now it just logs a heartbeat and current time.
-    """
-    now_local = get_now_local()
-    logger.info("Lumi heartbeat 💡 | Local time: %s", now_local.isoformat())
-
-    # Example placeholder computations using numpy so the import isn't "wasted"
-    # (Safe to remove when you add real logic.)
-    x = np.array([1, 2, 3])
-    _ = np.mean(x)  # just to show numpy is in use
-
-    # If you later call an API, it might look like this:
-    #
-    # response = requests.get("https://api.example.com/ping", timeout=10)
-    # logger.info("API status: %s", response.status_code)
-
-
-# -----------------------------
-# Main loop
-# -----------------------------
+def lumi_heartbeat(now):
+    logging.info(f"Lumi heartbeat 💡 | Local time: {now.isoformat()}")
 
 def main_loop():
-    logger.info("Lumi started ✅ | TZ=%s | LOOP_SECONDS=%s", TIMEZONE_NAME, LOOP_SECONDS)
+    logging.info("Lumi started with full Trade Engine 🔥")
 
     while True:
-        try:
-            run_lumi_cycle()
-        except Exception as e:
-            logger.exception("Unexpected error in Lumi cycle: %s", e)
+        now = datetime.now(TZ)
+        lumi_heartbeat(now)
 
-        # Sleep between cycles so the worker stays alive but not spammy
+        # Only evaluate on M5 close
+        if is_m5_close(now):
+            logging.info("M5 close detected — running market analysis...")
+
+            # NEWS CHECK
+            severity = fetch_news_rating(PAIR)
+            logging.info(f"News severity: {severity}")
+
+            # ANALYSE MARKET
+            signal = analyze_market_and_generate_signal(PAIR, severity)
+
+            if signal:
+                msg = (
+                    f"🚀 **LUMI SIGNAL** 🚀\n\n"
+                    f"Pair: {PAIR}\n"
+                    f"Direction: {signal['direction']}\n"
+                    f"Confidence: {signal['confidence']}%\n"
+                    f"Entry Zone: {signal['entry']}\n"
+                    f"SL: {signal['sl']}\n"
+                    f"TP: {signal['tp']}\n"
+                    f"Reason: {signal['reason']}\n"
+                    f"News Filter: {severity}\n"
+                    f"Time: {now.strftime('%Y-%m-%d %H:%M')}"
+                )
+                send_telegram_message(msg)
+                logging.info("Signal sent to Telegram.")
+            else:
+                logging.info("No signal this candle.")
+
         time.sleep(LOOP_SECONDS)
 
 
 if __name__ == "__main__":
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        logger.info("Lumi stopped manually (KeyboardInterrupt).")
-    except Exception as e:
-        logger.exception("Fatal error in Lumi main: %s", e)
-        raise
+    main_loop()
