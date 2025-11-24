@@ -20,6 +20,7 @@ TD_BASE_URL = "https://api.twelvedata.com/time_series"
 
 # Trading windows in local time (Europe/London)
 TRADING_WINDOWS = [
+    ("23:00", "04:30"),   # Asian morning
     ("07:00", "11:00"),   # London morning
     ("12:00", "16:30"),   # London/NY overlap
 ]
