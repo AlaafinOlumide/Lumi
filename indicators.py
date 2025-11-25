@@ -2,41 +2,74 @@ import numpy as np
 import pandas as pd
 
 
-def compute_rsi(close, period=14):
-    delta = np.diff(close)
-    gain = np.maximum(delta, 0)
-    loss = np.maximum(-delta, 0)
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
 
-    avg_gain = pd.Series(gain).ewm(alpha=1/period).mean()
-    avg_loss = pd.Series(loss).ewm(alpha=1/period).mean()
 
+def bollinger_bands(df: pd.DataFrame, period: int = 20, std_mult: float = 2.0):
+    mid = sma(df["close"], period)
+    std = df["close"].rolling(period).std()
+    upper = mid + std_mult * std
+    lower = mid - std_mult * std
+    return upper, mid, lower
+
+
+def rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    delta = df["close"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    gain_series = pd.Series(gain, index=df.index)
+    loss_series = pd.Series(loss, index=df.index)
+    avg_gain = gain_series.rolling(period).mean()
+    avg_loss = loss_series.rolling(period).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return np.append([50], rsi.values)
+    rsi_values = 100 - (100 / (1 + rs))
+    return rsi_values
 
 
-def compute_stochastic(high, low, close, k=14, d=3):
-    lowest = pd.Series(low).rolling(k).min()
-    highest = pd.Series(high).rolling(k).max()
-    stoch_k = 100 * ((close - lowest) / (highest - lowest))
-    stoch_d = stoch_k.rolling(d).mean()
-    return stoch_k.fillna(50).values, stoch_d.fillna(50).values
+def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
+    lowest_low = df["low"].rolling(k_period).min()
+    highest_high = df["high"].rolling(k_period).max()
+    stoch_k = 100 * (df["close"] - lowest_low) / (highest_high - lowest_low)
+    stoch_d = stoch_k.rolling(d_period).mean()
+    return stoch_k, stoch_d
 
 
-def compute_bollinger(close, period=20, std=2):
-    mid = pd.Series(close).rolling(period).mean()
-    sd = pd.Series(close).rolling(period).std()
-    upper = mid + std * sd
-    lower = mid - std * sd
-    return mid.fillna(method="bfill").values, upper.fillna(method="bfill").values, lower.fillna(method="bfill").values
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
 
-def compute_ma(close, period):
-    return pd.Series(close).rolling(period).mean().fillna(method="bfill").values
+def engulfing_pattern(df: pd.DataFrame) -> str | None:
+    """
+    Simple 2-candle engulfing detector.
+    Returns "bullish", "bearish", or None.
+    """
+    if len(df) < 2:
+        return None
 
+    c1 = df.iloc[-2]
+    c2 = df.iloc[-1]
 
-def compute_atr(high, low, close, period=14):
-    tr = np.maximum(high[1:], close[:-1])
-    tr = np.maximum(tr - low[1:], high[1:] - close[:-1])
-    atr = pd.Series(tr).rolling(period).mean().fillna(method="bfill")
-    return np.append([atr.iloc[0]], atr.values)
+    # Bullish engulfing
+    if (
+        c1["close"] < c1["open"]
+        and c2["close"] > c2["open"]
+        and c2["close"] > c1["open"]
+        and c2["open"] < c1["close"]
+    ):
+        return "bullish"
+
+    # Bearish engulfing
+    if (
+        c1["close"] > c1["open"]
+        and c2["close"] < c2["open"]
+        and c2["open"] > c1["close"]
+        and c2["close"] < c1["open"]
+    ):
+        return "bearish"
+
+    return None
