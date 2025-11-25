@@ -3,209 +3,130 @@ import time
 import pytz
 import requests
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
+from core.telegram import send_telegram_message
+from core.signals import generate_signal
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
+
+# ============================================================
+# 1. SAFELY LOAD ENVIRONMENT VARIABLES
+#    If Render fails to load them, fallback to your real keys.
+# ============================================================
+
+TD_API_KEY = os.environ.get("TD_API_KEY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+
+# FALLBACKS (your real keys)
+if not TD_API_KEY:
+    TD_API_KEY = "9ab283d3938d4a19b5481f72fa53df6b"
+
+if not BOT_TOKEN:
+    BOT_TOKEN = "7950450689:AAGPfU9IR7kgrX9eWEE2216tV4YQT8gKGqM"
+
+if not CHAT_ID:
+    CHAT_ID = "1302419329"
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 SYMBOL = "XAU/USD"
-TD_API_KEY = os.getenv("TD_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-TZ = pytz.timezone("Europe/London")
+TIMEZONE = pytz.timezone("Europe/London")
 LOOP_SECONDS = 60
 
 TRADING_WINDOWS = [
     ("23:00", "04:30"),
     ("07:00", "11:00"),
-    ("12:00", "16:30"),
+    ("12:00", "16:30")
 ]
 
-# ---------------------------------------------------------
-# UTILITIES
-# ---------------------------------------------------------
 
-def log(msg):
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} | {msg}")
+# ============================================================
+# HELPER: CHECK IF CURRENT TIME IS IN TRADING WINDOW
+# ============================================================
 
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except:
-        pass
-
-def fetch_td(symbol, interval, output="values"):
-    if not TD_API_KEY:
-        log("ERROR | TD_API_KEY not set")
-        return None
-
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TD_API_KEY}&outputsize=200"
-    r = requests.get(url).json()
-
-    if "status" in r and r["status"] == "error":
-        log(f"ERROR | Twelve Data error ({interval}): {r}")
-        return None
-    if output not in r:
-        return None
-    return r[output]
-
-def is_m5_close():
-    t = datetime.now(TZ)
-    return t.minute % 5 == 0 and t.second < 3
-
-def in_session():
-    now = datetime.now(TZ).time()
+def in_trading_window():
+    now = datetime.now(TIMEZONE).time()
     for start, end in TRADING_WINDOWS:
-        t1 = datetime.strptime(start, "%H:%M").time()
-        t2 = datetime.strptime(end, "%H:%M").time()
-        if t1 <= now <= t2:
+        start_t = datetime.strptime(start, "%H:%M").time()
+        end_t = datetime.strptime(end, "%H:%M").time()
+
+        if start_t <= now <= end_t:
             return True
     return False
 
-# ---------------------------------------------------------
-# TECHNICAL INDICATORS
-# ---------------------------------------------------------
 
-def atr(high, low, close, period=14):
-    trs = []
-    for i in range(1, len(close)):
-        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-        trs.append(tr)
-    return np.mean(trs[-period:])
+# ============================================================
+# HELPER: GET DATA FROM TWELVE DATA
+# ============================================================
 
-def rsi(close, period=14):
-    delta = np.diff(close)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = np.mean(gain[-period:])
-    avg_loss = np.mean(loss[-period:])
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1+rs))
+def get_data(interval, bars=200):
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={SYMBOL.replace('/', '')}"
+        f"&interval={interval}"
+        f"&apikey={TD_API_KEY}"
+        f"&outputsize={bars}"
+    )
 
-# ---------------------------------------------------------
-# STRATEGY LOGIC (OPTION A3 — FAST SNIPER)
-# ---------------------------------------------------------
+    r = requests.get(url).json()
 
-def evaluate_signal():
-    # Fetch data
-    h1 = fetch_td(SYMBOL, "1h")
-    m15 = fetch_td(SYMBOL, "15min")
-    m5 = fetch_td(SYMBOL, "5min")
-
-    if not h1 or not m15 or not m5:
+    if "status" in r and r["status"] == "error":
+        print(f"❌ Twelve Data error ({interval}): {r}")
         return None
 
-    # Convert
-    def extract(data):
-        close = np.array([float(v["close"]) for v in data])
-        high = np.array([float(v["high"]) for v in data])
-        low = np.array([float(v["low"]) for v in data])
-        return close, high, low
-
-    h1_close, h1_high, h1_low = extract(h1)
-    m15_close, m15_high, m15_low = extract(m15)
-    m5_close, m5_high, m5_low = extract(m5)
-
-    # Indicators
-    h1_rsi = rsi(h1_close)
-    m15_rsi_val = rsi(m15_close)
-    atr_val = atr(m5_high, m5_low, m5_close)
-    last = m5_close[-1]
-    prev = m5_close[-2]
-
-    wick_top = m5_high[-1] - max(last, prev)
-    wick_bottom = min(last, prev) - m5_low[-1]
-    body = abs(last - prev)
-
-    # -----------------------------------------------------
-    # OPTION A3 — SIGNAL CONDITIONS (Fast, more entries)
-    # -----------------------------------------------------
-
-    # 1. Trend check (H1 direction)
-    trend_up = h1_close[-1] > np.mean(h1_close[-20:])
-    trend_down = h1_close[-1] < np.mean(h1_close[-20:])
-
-    # 2. M15 momentum (more flexible than A1/A2)
-    bullish_momentum = m15_close[-1] > np.mean(m15_close[-10:])
-    bearish_momentum = m15_close[-1] < np.mean(m15_close[-10:])
-
-    # 3. ATR threshold (reduced for A3)
-    if atr_val < 0.40:  # A3 uses lighter filter
+    if "values" not in r:
+        print(f"❌ No values returned for {interval}: {r}")
         return None
 
-    # 4. Candle confirmation (looser wick rules)
-    if wick_top > body * 2.5 or wick_bottom > body * 2.5:
-        return None
+    return r["values"]
 
-    # 5. Signal logic
-    # BUY
-    if trend_up and bullish_momentum and last > prev:
-        return {
-            "dir": "BUY",
-            "entry": last,
-            "sl": last - (atr_val * 2),
-            "tp": last + (atr_val * 4)
-        }
 
-    # SELL
-    if trend_down and bearish_momentum and last < prev:
-        return {
-            "dir": "SELL",
-            "entry": last,
-            "sl": last + (atr_val * 2),
-            "tp": last - (atr_val * 4)
-        }
-
-    return None
-
-# ---------------------------------------------------------
+# ============================================================
 # MAIN LOOP
-# ---------------------------------------------------------
+# ============================================================
 
-log("Lumi started with full Option A3 Sniper Engine ⚡")
+print("🔥 Lumi Full Engine Loaded — Starting...")
 
 while True:
-    try:
-        now = datetime.now(TZ)
-        log(f"Lumi heartbeat 💡 | Local time: {now.isoformat()}")
+    now = datetime.now(TIMEZONE)
 
-        if not in_session():
-            log("Outside trading session.")
-            time.sleep(LOOP_SECONDS)
-            continue
+    # Heartbeat
+    print(f"{now} | INFO | Lumi heartbeat 💡")
 
-        if not is_m5_close():
-            log("Not an M5 close; waiting.")
-            time.sleep(LOOP_SECONDS)
-            continue
+    # Check if candle closed (minute divisible by 5)
+    if now.minute % 5 != 0:
+        print("Not an M5 close; waiting.")
+        time.sleep(LOOP_SECONDS)
+        continue
 
-        log("M5 close detected — evaluating...")
-        signal = evaluate_signal()
+    print("M5 close detected — fetching data & evaluating signal...")
 
-        if signal:
-            msg = (
-                f"🔥 LUMI SIGNAL (A3 FAST)\n"
-                f"Pair: {SYMBOL}\n"
-                f"Direction: {signal['dir']}\n"
-                f"Entry: {signal['entry']}\n"
-                f"SL: {signal['sl']}\n"
-                f"TP: {signal['tp']}\n"
-                f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            log("SIGNAL SENT!")
-            send_telegram(msg)
-        else:
-            log("No signal — conditions not met.")
+    # --------------------------------------------------------
+    # Fetch TF data
+    # --------------------------------------------------------
 
-    except Exception as e:
-        log(f"ERROR | {e}")
+    data_5m = get_data("5min")
+    data_15m = get_data("15min")
+    data_1h = get_data("1h")
+
+    if data_5m is None or data_15m is None or data_1h is None:
+        print("TA Fetch Error — data unavailable.")
+        time.sleep(LOOP_SECONDS)
+        continue
+
+    # --------------------------------------------------------
+    # Generate Trading Signal
+    # --------------------------------------------------------
+
+    signal = generate_signal(data_5m, data_15m, data_1h)
+
+    if not signal:
+        print("No signal — filters not satisfied.")
+    else:
+        print(f"🔥 SIGNAL: {signal}")
+        send_telegram_message(BOT_TOKEN, CHAT_ID, signal)
 
     time.sleep(LOOP_SECONDS)
