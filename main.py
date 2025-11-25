@@ -1,317 +1,266 @@
+# main.py
+
 import os
 import time
 import logging
-from datetime import datetime
-from typing import List, Tuple, Optional
+import datetime as dt
+from typing import List, Tuple, Optional, Dict
 
+import pytz
 import requests
 import pandas as pd
-import pytz
 from dotenv import load_dotenv
 
-# =========================
-#  Bootstrap & Config
-# =========================
+from core.engine import TradingEngine, Signal
 
-load_dotenv()
 
-# Core config
-TZ_NAME = os.getenv("TZ", "Europe/London")
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "60"))
-SYMBOL = os.getenv("SYMBOL", "XAU/USD")
-
-# Trading windows (local TZ)
-#   23:00–04:30  → Asia / overnight
-#   07:00–11:00  → London
-#   12:00–16:30  → New York
-TRADING_WINDOWS: List[Tuple[str, str]] = [
-    ("23:00", "04:30"),
-    ("07:00", "11:00"),
-    ("12:00", "16:30"),
-]
-
-# Twelve Data
-TD_API_KEY = os.getenv("TD_API_KEY", "").strip()
-
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# =========================
-#  Logging
-# =========================
+# ---------- Logging setup ----------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("lumi-a3-pro")
+logger = logging.getLogger("Lumi")
 
 
-# =========================
-#  Utilities
-# =========================
+# ---------- ENV & config ----------
 
-def get_local_now() -> datetime:
-    tz = pytz.timezone(TZ_NAME)
-    return datetime.now(tz)
+load_dotenv()
 
+TZ_NAME = os.getenv("TZ", "Europe/London")
+LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "60"))
 
-def is_time_in_window(now: datetime, start: str, end: str) -> bool:
-    """
-    Return True if `now` is inside [start, end], handling midnight-crossing windows.
+TD_API_KEY = os.getenv("TD_API_KEY", "")
+TD_BASE_URL = "https://api.twelvedata.com/time_series"
 
-    start / end are "HH:MM" strings in local time.
-    Example crossing window: 23:00–04:30
-    """
-    now_t = now.time()
-    start_t = datetime.strptime(start, "%H:%M").time()
-    end_t = datetime.strptime(end, "%H:%M").time()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Normal window: e.g. 07:00–11:00
-    if start_t < end_t:
-        return start_t <= now_t <= end_t
+# SYMBOLS: comma-separated, e.g. "XAU/USD,USD/JPY"
+raw_symbols = os.getenv("SYMBOLS", "XAU/USD")
+SYMBOLS: List[str] = [s.strip() for s in raw_symbols.split(",") if s.strip()]
 
-    # Midnight-crossing window: e.g. 23:00–04:30
-    return now_t >= start_t or now_t <= end_t
+# TRADING_WINDOWS: e.g. "23:00-04:30,07:00-11:00,12:00-16:30"
+raw_windows = os.getenv(
+    "TRADING_WINDOWS",
+    "23:00-04:30,07:00-11:00,12:00-16:30",
+)
+TRADING_WINDOWS: List[Tuple[str, str]] = []
+for w in raw_windows.split(","):
+    w = w.strip()
+    if not w:
+        continue
+    start, end = w.split("-")
+    TRADING_WINDOWS.append((start.strip(), end.strip()))
 
-
-def inside_any_trading_window(now: datetime, windows: List[Tuple[str, str]]) -> bool:
-    return any(is_time_in_window(now, s, e) for s, e in windows)
-
-
-def is_m5_close(now: datetime, last_checked_bucket: Optional[datetime]) -> Tuple[bool, Optional[datetime]]:
-    """
-    Detect an M5 close using local time.
-
-    We define an M5 bucket at e.g. 08:50, 08:55, 09:00...
-    We trigger once per bucket using `last_checked_bucket`.
-    """
-    # Floor to minute
-    bucket = now.replace(second=0, microsecond=0)
-
-    # Only consider minutes that are multiples of 5
-    if bucket.minute % 5 != 0:
-        return False, last_checked_bucket
-
-    # If we've already processed this bucket, skip
-    if last_checked_bucket is not None and bucket <= last_checked_bucket:
-        return False, last_checked_bucket
-
-    return True, bucket
+TZ = pytz.timezone(TZ_NAME)
 
 
-# =========================
-#  Telegram
-# =========================
+# ---------- Telegram ----------
 
 def send_telegram_message(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials missing; cannot send message.")
+        logger.warning("Telegram not configured — skipping message: %s", text)
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
     }
-
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code != 200:
-            log.error("Telegram send error: %s | %s", resp.status_code, resp.text)
-    except Exception as e:
-        log.error("Telegram send exception: %s", e)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logger.error("Telegram error: %s | %s", r.status_code, r.text)
+    except Exception as exc:
+        logger.error("Telegram request failed: %s", exc)
 
 
-# =========================
-#  Market Data (Twelve Data)
-# =========================
+# ---------- Time helpers ----------
 
-def fetch_twelvedata_series(symbol: str, interval: str, outputsize: int = 200) -> Optional[pd.DataFrame]:
+def in_trading_window(now: dt.datetime) -> bool:
     """
-    Fetch OHLCV from Twelve Data and return a DataFrame sorted by datetime ascending.
+    now: tz-aware in TZ
+    """
+    current_time = now.time()
+    for start_str, end_str in TRADING_WINDOWS:
+        start_h, start_m = map(int, start_str.split(":"))
+        end_h, end_m = map(int, end_str.split(":"))
+        start_t = dt.time(start_h, start_m)
+        end_t = dt.time(end_h, end_m)
+
+        if start_t <= end_t:
+            # Same-day window
+            if start_t <= current_time <= end_t:
+                return True
+        else:
+            # Cross-midnight window, e.g. 23:00–04:30
+            if current_time >= start_t or current_time <= end_t:
+                return True
+    return False
+
+
+def is_m5_close(now: dt.datetime) -> bool:
+    """
+    Run loop once per minute; treat any timestamp with minute%5==0
+    as the M5 close moment.
+    """
+    return now.minute % 5 == 0
+
+
+# ---------- Data fetching (Twelve Data) ----------
+
+def fetch_ohlc(
+    symbol: str,
+    interval: str,
+    outputsize: int,
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLC from Twelve Data and return ascending DataFrame with:
+
+    columns: ["datetime", "open", "high", "low", "close"]
+    datetime: tz-aware (TZ)
     """
     if not TD_API_KEY:
-        log.error("TD_API_KEY not set; cannot fetch market data.")
+        logger.error("TD_API_KEY not set — cannot fetch data.")
         return None
 
-    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
-        "outputsize": outputsize,
         "apikey": TD_API_KEY,
+        "outputsize": outputsize,
+        "order": "desc",  # latest first
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-    except Exception as e:
-        log.error("Twelve Data exception (%s): %s", interval, e)
+        r = requests.get(TD_BASE_URL, params=params, timeout=10)
+        data = r.json()
+
+        if "status" in data and data["status"] == "error":
+            logger.error(
+                "Twelve Data error (%s, %s): code=%s, message=%s",
+                symbol,
+                interval,
+                data.get("code"),
+                data.get("message"),
+            )
+            return None
+
+        values = data.get("values")
+        if not values:
+            logger.error("No 'values' in Twelve Data response (%s, %s).", symbol, interval)
+            return None
+
+        df = pd.DataFrame(values)
+        # Columns from Twelve Data: datetime, open, high, low, close, volume
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+
+        # Convert to TZ and sort ascending
+        df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert(TZ)
+        df = df.sort_values("datetime").reset_index(drop=True)
+
+        return df
+
+    except Exception as exc:
+        logger.exception("Error fetching Twelve Data for %s (%s): %s", symbol, interval, exc)
         return None
 
-    status = data.get("status")
-    if status == "error":
-        log.error(
-            "Twelve Data error (%s): status=%s, code=%s, message=%s",
-            interval,
-            data.get("status"),
-            data.get("code"),
-            data.get("message"),
-        )
-        return None
 
-    values = data.get("values")
-    if not values:
-        log.error("Twelve Data error (%s): no 'values' field in response.", interval)
-        return None
+# ---------- Main trading loop ----------
 
-    df = pd.DataFrame(values)
-    if "datetime" not in df.columns:
-        log.error("Twelve Data error (%s): no 'datetime' column in values.", interval)
-        return None
-
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
-
-    # Convert numeric columns
-    for col in ("open", "high", "low", "close", "volume"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
-# =========================
-#  Simple Strategy (Option 1)
-# =========================
-
-def evaluate_signal_5m(df_5m: pd.DataFrame) -> Optional[dict]:
-    """
-    Very simple SMA crossover + momentum filter on 5m data.
-
-    This is intentionally light (Option 1) so it runs safely on Render.
-    You can later upgrade this to your full PPSS logic.
-    """
-    if df_5m is None or df_5m.empty:
-        return None
-
-    if len(df_5m) < 25:
-        # Not enough data
-        return None
-
-    closes = df_5m["close"].astype(float)
-
-    fast = closes.rolling(5).mean()
-    slow = closes.rolling(20).mean()
-
-    # Last two values for cross detection
-    prev_fast, prev_slow = fast.iloc[-2], slow.iloc[-2]
-    curr_fast, curr_slow = fast.iloc[-1], slow.iloc[-1]
-    curr_close = closes.iloc[-1]
-
-    # Basic volatility filter: candle body must be > small threshold
-    body = abs(curr_close - df_5m["open"].astype(float).iloc[-1])
-    atr_like = (df_5m["high"] - df_5m["low"]).astype(float).rolling(14).mean().iloc[-1]
-    if pd.isna(atr_like) or atr_like == 0:
-        return None
-
-    if body < 0.15 * atr_like:
-        # Too small / choppy
-        return None
-
-    # Bullish cross
-    if prev_fast < prev_slow and curr_fast > curr_slow:
-        return {
-            "direction": "buy",
-            "price": curr_close,
-            "reason": "5/20 SMA bullish cross with momentum",
-        }
-
-    # Bearish cross
-    if prev_fast > prev_slow and curr_fast < curr_slow:
-        return {
-            "direction": "sell",
-            "price": curr_close,
-            "reason": "5/20 SMA bearish cross with momentum",
-        }
-
-    return None
-
-
-def format_signal_message(symbol: str, signal: dict, now: datetime) -> str:
-    direction = signal["direction"].upper()
-    price = signal["price"]
-    reason = signal.get("reason", "Strategy conditions met")
-
-    ts = now.strftime("%Y-%m-%d %H:%M")
-    return (
-        f"🟢 *Lumi A3 Pro Signal*\n\n"
-        f"*Symbol:* `{symbol}`\n"
-        f"*Direction:* `{direction}`\n"
-        f"*Price:* `{price:.2f}`\n"
-        f"*Time:* `{ts} {TZ_NAME}`\n"
-        f"*Reason:* {reason}"
+def format_signal_message(sig: Signal) -> str:
+    direction_emoji = "🟢 BUY" if sig.direction == "BUY" else "🔴 SELL"
+    msg = (
+        f"*Lumi A3 Pro + PPSS Signal*\n"
+        f"Symbol: `{sig.symbol}`\n"
+        f"Direction: {direction_emoji}\n"
+        f"Entry: `{sig.entry:.3f}`\n"
+        f"SL: `{sig.sl:.3f}`\n"
+        f"TP: `{sig.tp:.3f}`\n"
+        f"Confidence: `{sig.confidence:.1f}` / 100\n"
+        f"Timeframe: `{sig.timeframe_entry}`\n"
+        f"Reason: {sig.reason}\n"
+        f"Time: `{sig.created_at.strftime('%Y-%m-%d %H:%M:%S %Z')}`"
     )
+    return msg
 
 
-# =========================
-#  Main Loop
-# =========================
+def format_tp_sl_message(sig: Signal, hit: str, price: float, now: dt.datetime) -> str:
+    flag = "🎯 TP HIT" if hit == "TP" else "⛔ SL HIT"
+    msg = (
+        f"*{flag}*\n"
+        f"Symbol: `{sig.symbol}`\n"
+        f"Direction: `{sig.direction}`\n"
+        f"Entry: `{sig.entry:.3f}`\n"
+        f"SL: `{sig.sl:.3f}`\n"
+        f"TP: `{sig.tp:.3f}`\n"
+        f"Hit price: `{price:.3f}`\n"
+        f"Opened at: `{sig.created_at.strftime('%Y-%m-%d %H:%M:%S %Z')}`\n"
+        f"Closed at: `{now.strftime('%Y-%m-%d %H:%M:%S %Z')}`"
+    )
+    return msg
 
-def main():
-    log.info("Lumi A3 Pro started 🔥")
-    log.info(
-        "Config: TZ=%s, LOOP_SECONDS=%s, SYMBOL=%s, TRADING_WINDOWS=%s",
+
+def main() -> None:
+    engine = TradingEngine()
+    logger.info(
+        "Lumi A3 Pro + PPSS started 🔥 | TZ=%s | LOOP_SECONDS=%s | SYMBOLS=%s | WINDOWS=%s",
         TZ_NAME,
         LOOP_SECONDS,
-        SYMBOL,
+        SYMBOLS,
         TRADING_WINDOWS,
     )
 
-    last_m5_bucket: Optional[datetime] = None
+    # In-memory tracking of open signals for TP/SL alerts
+    open_signals: Dict[str, Signal] = {}
 
     while True:
-        try:
-            now = get_local_now()
-            log.info("Lumi heartbeat 💡 | Local time: %s", now)
+        now = dt.datetime.now(TZ)
+        logger.info("Lumi heartbeat 💡 | Local time: %s", now.isoformat(timespec="seconds"))
 
-            # 1️⃣ Trading window check
-            if not inside_any_trading_window(now, TRADING_WINDOWS):
-                log.info("Not inside allowed trading window.")
-                time.sleep(LOOP_SECONDS)
-                continue
+        if not in_trading_window(now):
+            logger.info("Not inside allowed trading window — sleeping.")
+            time.sleep(LOOP_SECONDS)
+            continue
 
-            # 2️⃣ M5 close detection
-            m5_close, last_m5_bucket = is_m5_close(now, last_m5_bucket)
-            if not m5_close:
-                log.info("Not an M5 close; waiting.")
-                time.sleep(LOOP_SECONDS)
-                continue
+        if is_m5_close(now):
+            logger.info("M5 close detected — fetching data & evaluating signals...")
+            for symbol in SYMBOLS:
+                m5 = fetch_ohlc(symbol, "5min", outputsize=120)
+                m15 = fetch_ohlc(symbol, "15min", outputsize=120)
+                h1 = fetch_ohlc(symbol, "1h", outputsize=240)
 
-            log.info("M5 close detected — fetching data & evaluating signal...")
+                if m5 is None or m15 is None or h1 is None:
+                    logger.info("Skipping %s — missing data.", symbol)
+                    continue
 
-            # 3️⃣ Fetch 5m data
-            df_5m = fetch_twelvedata_series(SYMBOL, "5min", outputsize=200)
-            if df_5m is None or df_5m.empty:
-                log.info("TA Fetch Error (5m): no data returned.")
-                time.sleep(LOOP_SECONDS)
-                continue
+                sig = engine.evaluate(symbol, m5, m15, h1, now)
+                if sig is not None:
+                    # Send entry alert
+                    send_telegram_message(format_signal_message(sig))
+                    # Track for TP/SL alerts (overwrite any existing one for this symbol)
+                    open_signals[symbol] = sig
+                else:
+                    logger.info("No signal for %s this M5 close.", symbol)
 
-            # 4️⃣ Evaluate strategy
-            signal = evaluate_signal_5m(df_5m)
-
-            if not signal:
-                log.info("No signal — strategy conditions not met.")
-            else:
-                msg = format_signal_message(SYMBOL, signal, now)
-                log.info("Signal generated: %s", msg.replace("\n", " | "))
-                send_telegram_message(msg)
-
-        except Exception as e:
-            log.exception("Unexpected error in main loop: %s", e)
+        # TP/SL monitoring for open signals
+        if open_signals:
+            for symbol, sig in list(open_signals.items()):
+                # Use latest M5 close as proxy for current price
+                m5 = fetch_ohlc(symbol, "5min", outputsize=10)
+                if m5 is None or m5.empty:
+                    continue
+                last_price = float(m5["close"].iloc[-1])
+                hit = engine.check_tp_sl_hit(last_price, sig, buffer_points=0.0)
+                if hit:
+                    logger.info("%s %s hit for %s at price %.3f", symbol, hit, symbol, last_price)
+                    send_telegram_message(format_tp_sl_message(sig, hit, last_price, now))
+                    del open_signals[symbol]
 
         time.sleep(LOOP_SECONDS)
 
